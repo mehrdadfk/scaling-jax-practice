@@ -108,76 +108,39 @@ def moe_local_scan(A, W, B):
     output, _ = jax.lax.scan(body, output, jnp.arange(W.shape[0]))
     return output
 
-def moe_local_ragged(A, W, B):
-    print("moe_local_ragged W: ", B)
-    sorted_B, sorted_indices = jax.lax.sort_key_val(B, jnp.arange(S))
+def moe_local_ragged(A, W, B, device_index=None):
+
+    local_experts = W.shape[0]
+    tokens = A.shape[0]
+
+    if device_index is not None:
+        owns_expert = B // local_experts == device_index
+        A = jnp.where(owns_expert[:, None], A, 0)
+        B = jnp.where(owns_expert, B % local_experts, 0)
+
+    sorted_B, sorted_indices = jax.lax.sort_key_val(B, jnp.arange(tokens))
     sorted_A = A[sorted_indices]
 
     # Tokens per expert -- tells _dot where each expert's group starts/ends.
-    group_sizes = jnp.bincount(sorted_B, length=E)
+    group_sizes = jnp.bincount(sorted_B, length=local_experts)
 
     sorted_out = jax.lax.ragged_dot(sorted_A, W, group_sizes)  # [S, F]
 
     # Undo the sort to restore the original token order.
-    return jnp.zeros((S, F), sorted_out.dtype).at[sorted_indices].set(sorted_out)
+    return jnp.zeros((tokens, W.shape[2]), sorted_out.dtype).at[sorted_indices].set(sorted_out)
 
 # this method will be used with shard_map. and important difference between jit auto sharding and shard map is that 
-# we should take care of e index which is local on each device not gloabal. and also we may need to to a pcast to varying for the output of each device.
-#pcast(..., to="varying") is needed because shard_map initially treats output as replicated across mesh axis X, but the scan makes it different on each device.
-def moe_all_gather(A, W, B):
-    print("moe_all_gatherW: ", W)
-    gathered_A = jax.lax.all_gather(A, axis_name="X", axis=0, tiled=True)# tiled true brings it to original shape, otherwise it will be [num_devices, S_local, D]
-    gathered_B = jax.lax.all_gather(B, axis_name="X", axis=0, tiled=True)
-    print("moe_all_gather gathered_A: ", gathered_A)
-    local_expert_offset = jax.lax.axis_index("X") * W.shape[0]
-    owns_expert = (gathered_B >= local_expert_offset) & (
-        gathered_B < local_expert_offset + W.shape[0]
-    )
-    local_A = jnp.where(owns_expert[:, None], gathered_A, 0)
-    local_B = jnp.where(owns_expert, gathered_B - local_expert_offset, 0)
-    output = moe_local_sorted(local_A, W, local_B)
-    
-    res = jax.lax.psum_scatter(output, axis_name="X", scatter_dimension=0, tiled=True)
-    return res
-
-def moe_all_gather_sorted_buffer(A, W, B):
-    print("W: ", W)
-    gathered_A = jax.lax.all_gather(A, axis_name="X", axis=0, tiled=True)
-    gathered_B = jax.lax.all_gather(B, axis_name="X", axis=0, tiled=True)
-    gathered_W = jax.lax.all_gather(W, axis_name="X", axis=0, tiled=True)
-    output = moe_local_sorted(gathered_A, gathered_W, gathered_B)
-    res = jax.lax.psum_scatter(output, axis_name="X", scatter_dimension=0, tiled=True)
-    return res
-
-def moe_all_gather_ragged2(A, W, B):
-
-    local_experts = W.shape[0]
+# we should take care of e index which is local on each device not gloabal. and also we may need a pcast to varying for the output of each device in case of scan method. 
+#pcast(..., to="varying") is needed for scan because shard_map initially treats output as replicated across mesh axis X, but the scan makes it different on each device.
+def moe_all_gather_ragged(A, W, B):
     device_index = jax.lax.axis_index("X")
 
     A_full = jax.lax.all_gather(A, axis_name="X", axis=0, tiled=True)
     B_full = jax.lax.all_gather(B, axis_name="X", axis=0, tiled=True)
-    total_tokens = A_full.shape[0]
+    out_full = moe_local_ragged(A_full, W, B_full, device_index)
 
-    # reindex to local expert index
-    local_B = B_full % local_experts
-    sorted_B, sorted_indices = jax.lax.sort_key_val(local_B, jnp.arange(total_tokens))
-    sorted_A = A_full[sorted_indices]
-    group_sizes = jnp.bincount(sorted_B, length=local_experts)
-    sorted_out = jax.lax.ragged_dot(sorted_A, W, group_sizes)
-    out_full = jnp.zeros((total_tokens, W.shape[2]), sorted_out.dtype)
-    out_full = out_full.at[sorted_indices].set(
-        sorted_out
-        * (B_full[sorted_indices] // local_experts == device_index)[:, None]
-    )
-
-    # Local expert ranges own disjoint rows. Sum and return each device's
-    # original contiguous token slice in one collective.
-    return jax.lax.psum_scatter(
-        out_full,
-        axis_name="X",
-        scatter_dimension=0,
-        tiled=True,
-    )
+    #right now each device its own [S,F] local sum. so we need ScatterSum remove the local sum and have the result on sharded output.
+    return jax.lax.psum_scatter(out_full,axis_name="X",scatter_dimension=0,tiled=True,)
 
 
 mesh = jax.make_mesh((4,), ("X",), (Auto,))
@@ -211,9 +174,7 @@ moe_ragged_jit = jax.jit(moe_local_ragged, out_shardings=out_sharding)
 
 with jax.set_mesh(explicit_mesh):
     explicit_specs = (jax.P("X", None), jax.P("X", None, None), jax.P("X"))
-    moe_all_gather_jit = jax.jit(jax.shard_map(moe_all_gather, in_specs = explicit_specs, out_specs = jax.P("X", None)))
-    moe_all_gather_sorted_buffer_jit = jax.jit(jax.shard_map(moe_all_gather_sorted_buffer, in_specs = explicit_specs, out_specs = jax.P("X", None)))
-    moe_all_gather_ragged2_jit = jax.jit(jax.shard_map(moe_all_gather_ragged2, in_specs = explicit_specs, out_specs = jax.P("X", None)))
+    moe_all_gather_ragged_jit = jax.jit(jax.shard_map(moe_all_gather_ragged, in_specs = explicit_specs, out_specs = jax.P("X", None)))
     
 
 for name, fn in [
@@ -246,7 +207,7 @@ if __name__ == "__main__":
             #("moe_all_gather (pass 1: all_gather)", moe_all_gather_jit),
             #("moe_shard_map_alltoall (pass 2: all_to_all + while_loop)", moe_all_gather_jit),
             #("moe_all_gather_sorted_buffer", moe_all_gather_sorted_buffer_jit),
-            ("moe_all_gather_ragged2", moe_all_gather_ragged2_jit)
+            ("moe_all_gather_ragged", moe_all_gather_ragged_jit)
         ]:
             out = fn(A_explicit_sharded, W_explicit_sharded, B_explicit_sharded)
             print("test1\n")
