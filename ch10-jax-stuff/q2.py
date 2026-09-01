@@ -89,15 +89,6 @@ Memory ≈ E*S*D + E*S*F
 
     return out
 
-"""
-for e in experts:
-    for token in tokens:
-        if B[token] == e:
-            Out[token] = A[token] @ W[e]
-
-scan controls how much you keep in memory; it doesn't magically remove unnecessary computation.
-
-"""
 def moe_local_scan(A, W, B):
     def body(output, e):
         mask = (B == e) [:, None] # [S, 1]
@@ -121,17 +112,12 @@ def moe_local_ragged(A, W, B, device_index=None):
     sorted_B, sorted_indices = jax.lax.sort_key_val(B, jnp.arange(tokens))
     sorted_A = A[sorted_indices]
 
-    # Tokens per expert -- tells _dot where each expert's group starts/ends.
     group_sizes = jnp.bincount(sorted_B, length=local_experts)
 
     sorted_out = jax.lax.ragged_dot(sorted_A, W, group_sizes)  # [S, F]
-
-    # Undo the sort to restore the original token order.
+    
     return jnp.zeros((tokens, W.shape[2]), sorted_out.dtype).at[sorted_indices].set(sorted_out)
 
-# this method will be used with shard_map. and important difference between jit auto sharding and shard map is that 
-# we should take care of e index which is local on each device not gloabal. and also we may need a pcast to varying for the output of each device in case of scan method. 
-#pcast(..., to="varying") is needed for scan because shard_map initially treats output as replicated across mesh axis X, but the scan makes it different on each device.
 def moe_all_gather_ragged(A, W, B):
     device_index = jax.lax.axis_index("X")
 
@@ -139,10 +125,75 @@ def moe_all_gather_ragged(A, W, B):
     B_full = jax.lax.all_gather(B, axis_name="X", axis=0, tiled=True)
     out_full = moe_local_ragged(A_full, W, B_full, device_index)
 
-    #right now each device its own [S,F] local sum. so we need ScatterSum remove the local sum and have the result on sharded output.
     return jax.lax.psum_scatter(out_full,axis_name="X",scatter_dimension=0,tiled=True,)
 
 
+def moe_all_to_all_ragged(A, W, B):
+    chunk_size = 128
+    num_chunks = (S + chunk_size - 1) // chunk_size
+    N = jax.lax.axis_size("X")
+    C = num_chunks * chunk_size 
+    dst = B // W.shape[0] 
+    e_local = B % W.shape[0]  
+    
+    onehot_B = jax.nn.one_hot(dst, N, dtype=jnp.int32)
+    slot = jnp.sum(onehot_B * (jnp.cumsum(onehot_B, axis=0) - 1), axis=1).astype(jnp.int32)
+    
+
+# token:       0  1  2  3  4  5
+# dst:         2  0  2  1  2  0
+#
+# onehot_B =
+# [[0, 0, 1, 0],  # token 0 -> device 2
+#  [1, 0, 0, 0],  # token 1 -> device 0
+#  [0, 0, 1, 0],  # token 2 -> device 2
+#  [0, 1, 0, 0],  # token 3 -> device 1
+#  [0, 0, 1, 0],  # token 4 -> device 2
+#  [1, 0, 0, 0]]  # token 5 -> device 0
+
+# [[0, 0, 1, 0],
+#  [1, 0, 1, 0],
+#  [1, 0, 2, 0],
+#  [1, 1, 2, 0],
+#  [1, 1, 3, 0],
+#  [2, 1, 3, 0]]
+    send_A = jnp.zeros((N, C, D), A.dtype).at[dst, slot].set(A)
+    send_B = jnp.zeros((N, C), jnp.int32).at[dst, slot].set(e_local)
+    
+    def body(i, output):
+        start = i * chunk_size
+        chunk_A = jax.lax.dynamic_slice_in_dim(send_A, start, chunk_size, axis=1) # send_A[:, 0:128, :]= [4, 128, 64]
+        chunk_B = jax.lax.dynamic_slice_in_dim(send_B, start, chunk_size, axis=1)
+        rec_A = jax.lax.all_to_all(chunk_A, axis_name="X", split_axis=0, concat_axis=0, tiled=True)
+        rec_B = jax.lax.all_to_all(chunk_B, axis_name="X", split_axis=0, concat_axis=0, tiled=True)
+
+        
+        #row 0 -> tokens device 0 wants to send to device 0
+        #row 1 -> tokens device 0 wants to send to device 1
+        #row 2 -> tokens device 0 wants to send to device 2
+        #row 3 -> tokens device 0 wants to send to device 3
+        
+        #rec_A[0] -> tokens sent from device 0 to device 3
+        #rec_A[1] -> tokens sent from device 1 to device 3
+        #rec_A[2] -> tokens sent from device 2 to device 3
+        #rec_A[3] -> tokens sent from device 3 to device 3
+        
+        received_out = moe_local_ragged(
+            rec_A.reshape(N * chunk_size, D),
+            W,
+            rec_B.reshape(N * chunk_size),
+        ).reshape(N, chunk_size, F)
+        
+        returned_out = jax.lax.all_to_all(
+            received_out, axis_name="X", split_axis=0, concat_axis=0
+        )
+        output = jax.lax.dynamic_update_slice_in_dim(output, returned_out, start, axis=1)
+        return output
+    
+    out_acc0 = jax.lax.pcast(jnp.zeros((N, C, F), A.dtype), ("X",), to="varying")
+    output_by_bucket = jax.lax.fori_loop(0, num_chunks, body, out_acc0)
+    return output_by_bucket[dst, slot]
+   
 mesh = jax.make_mesh((4,), ("X",), (Auto,))
 jax.set_mesh(mesh)
 
@@ -175,6 +226,7 @@ moe_ragged_jit = jax.jit(moe_local_ragged, out_shardings=out_sharding)
 with jax.set_mesh(explicit_mesh):
     explicit_specs = (jax.P("X", None), jax.P("X", None, None), jax.P("X"))
     moe_all_gather_ragged_jit = jax.jit(jax.shard_map(moe_all_gather_ragged, in_specs = explicit_specs, out_specs = jax.P("X", None)))
+    moe_all_to_all_ragged_jit = jax.jit(jax.shard_map(moe_all_to_all_ragged, in_specs = explicit_specs, out_specs = jax.P("X", None)))
     
 
 for name, fn in [
@@ -207,7 +259,8 @@ if __name__ == "__main__":
             #("moe_all_gather (pass 1: all_gather)", moe_all_gather_jit),
             #("moe_shard_map_alltoall (pass 2: all_to_all + while_loop)", moe_all_gather_jit),
             #("moe_all_gather_sorted_buffer", moe_all_gather_sorted_buffer_jit),
-            ("moe_all_gather_ragged", moe_all_gather_ragged_jit)
+            # ("moe_all_gather_ragged", moe_all_gather_ragged_jit),
+            ("moe_all_to_all_ragged", moe_all_to_all_ragged_jit),
         ]:
             out = fn(A_explicit_sharded, W_explicit_sharded, B_explicit_sharded)
             print("test1\n")
@@ -216,3 +269,12 @@ if __name__ == "__main__":
             print (jax.device_get(out) )
             assert jnp.allclose(jax.device_get(want), jax.device_get(out), atol=1e-2), f"{name} result doesn't match reference"
 
+"""
+footnotes :
+1. in moe_all_to_all_ragged this time instead of sorting to determine the position of token, i will use hot one method
+The cumulative sum counts how many tokens have already been assigned to each bucket.
+
+2. pcast(..., to="varying") is needed for scan because shard_map initially treats output as replicated across mesh axis X, but the scan makes it different on each device.
+
+3. because the number of tokens per expert can be uneven, we will add padding to make it same shape. 
+"""
