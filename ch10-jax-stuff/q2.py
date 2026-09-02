@@ -130,7 +130,8 @@ def moe_all_gather_ragged(A, W, B):
 
 def moe_all_to_all_ragged(A, W, B):
     chunk_size = 128
-    num_chunks = (S + chunk_size - 1) // chunk_size
+    tokens = A.shape[0]
+    num_chunks = (tokens + chunk_size - 1) // chunk_size
     N = jax.lax.axis_size("X")
     C = num_chunks * chunk_size 
     dst = B // W.shape[0] 
@@ -193,30 +194,53 @@ def moe_all_to_all_ragged(A, W, B):
     out_acc0 = jax.lax.pcast(jnp.zeros((N, C, F), A.dtype), ("X",), to="varying")
     output_by_bucket = jax.lax.fori_loop(0, num_chunks, body, out_acc0)
     return output_by_bucket[dst, slot]
+
+def moe_k_expert(A, W, BK):
+    experts_per_token = BK.shape[1]
+
+    def body(expert_index, accumulated_out):
+        expert_out = moe_all_to_all_ragged(A, W, BK[:, expert_index])
+        return accumulated_out + expert_out
+
+    initial_out = jax.lax.pcast(jnp.zeros((A.shape[0], W.shape[2]), dtype=A.dtype), ("X",), to="varying")
+    total_out = jax.lax.fori_loop(0, experts_per_token, body, initial_out)
+    return total_out / experts_per_token
+   
+   
+def moe_k_expert2(A, W, BK):
+    tokens, experts_per_token = BK.shape
+    repeated_A = jnp.repeat(A, experts_per_token, axis=0)
+    routed_out = moe_all_to_all_ragged(repeated_A, W, BK.reshape(-1))
+    return routed_out.reshape(tokens, experts_per_token, W.shape[2]).mean(axis=1)
+       
    
 mesh = jax.make_mesh((4,), ("X",), (Auto,))
 jax.set_mesh(mesh)
 
-S, D, F, E = 4, 64, 128, 8
+S, D, F, E , K = 4, 64, 128, 8, 3
 key = jax.random.PRNGKey(0)
 W = jax.random.normal(key, (E, D, F), jnp.float32)
 A = jax.random.normal(key, (S, D), jnp.float32)
 B = jax.random.randint(key, (S,), 0, E)
+BK = jax.random.randint(key, (S, K), 0, E)
 
 W_sharding = jax.NamedSharding(mesh, jax.P("X", None, None))
 A_sharding = jax.NamedSharding(mesh, jax.P("X", None))
 B_sharding = jax.NamedSharding(mesh, jax.P("X"))
+BK_sharding = jax.NamedSharding(mesh, jax.P("X", None))
 out_sharding = jax.NamedSharding(mesh, jax.P("X", None))
 
 W_sharded = jax.device_put(W, W_sharding)
 A_sharded = jax.device_put(A, A_sharding)
 B_sharded = jax.device_put(B, B_sharding)
+BK_sharded = jax.device_put(BK, BK_sharding)
 
 explicit_mesh = jax.make_mesh((4,), ("X",), (Explicit,))
 
 W_explicit_sharded = jax.device_put(W, jax.NamedSharding(explicit_mesh, jax.P("X", None, None)))
 A_explicit_sharded = jax.device_put(A, jax.NamedSharding(explicit_mesh, jax.P("X", None)))
 B_explicit_sharded = jax.device_put(B, jax.NamedSharding(explicit_mesh, jax.P("X")))
+BK_explicit_sharded = jax.device_put(BK, jax.NamedSharding(explicit_mesh, jax.P("X", None)))
 
 moe_naive_reference_jit = jax.jit(moe_naive_reference, out_shardings=out_sharding)
 moe_sorted_jit = jax.jit(moe_local_sorted, out_shardings=out_sharding)
@@ -227,6 +251,7 @@ with jax.set_mesh(explicit_mesh):
     explicit_specs = (jax.P("X", None), jax.P("X", None, None), jax.P("X"))
     moe_all_gather_ragged_jit = jax.jit(jax.shard_map(moe_all_gather_ragged, in_specs = explicit_specs, out_specs = jax.P("X", None)))
     moe_all_to_all_ragged_jit = jax.jit(jax.shard_map(moe_all_to_all_ragged, in_specs = explicit_specs, out_specs = jax.P("X", None)))
+    moe_k_expert_jit = jax.jit(jax.shard_map(moe_k_expert, in_specs = explicit_specs, out_specs = jax.P("X", None)))
     
 
 for name, fn in [
@@ -240,7 +265,8 @@ for name, fn in [
 if __name__ == "__main__":
     want = moe_naive_reference(A, W, B)
     got = moe_local_sorted(A, W, B)
-    
+    want_k = jnp.einsum("sd,skdf->skf", A, W[BK]).mean(axis=1)
+
     print(f"moe_local matches reference: {jnp.allclose(got, want)}")
     
     print("Profiling moe_sorted_jit (the version that AllGathers A)...")
@@ -268,6 +294,10 @@ if __name__ == "__main__":
             print("test2\n")
             print (jax.device_get(out) )
             assert jnp.allclose(jax.device_get(want), jax.device_get(out), atol=1e-2), f"{name} result doesn't match reference"
+
+        got_k = moe_k_expert_jit(A_explicit_sharded, W_explicit_sharded, BK_explicit_sharded)
+        assert jnp.allclose(jax.device_get(want_k), jax.device_get(got_k), atol=1e-2), "moe_k_expert result doesn't match reference"
+        print("moe_k_expert matches reference")
 
 """
 footnotes :
