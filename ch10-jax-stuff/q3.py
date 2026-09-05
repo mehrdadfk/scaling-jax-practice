@@ -61,62 +61,15 @@ def collective_scatter_reduce_matmul(tmp, w):
     out = jax.lax.fori_loop(1, N, body, first_mat_mul)
     return out    
 
-#--------------------------------------------
-# Part 3  # In[BX, DY] *D Win[D, FY] *F Wout[FY, D] -> Out[BX, DY] 
-#--------------------------------------------
- 
-def collective_mlp(input, w_in, w_out):
-    temp = collective_all_gather_matmul(input, w_in)
-    out = collective_scatter_reduce_matmul(temp, w_out)
-    return out
-    
-# In[BX, DY] *D Win[D, FY] -> Tmp[BX, FY]
-def collective_all_gather_matmul(input, w_in):
-    N = jax.lax.axis_size("Y")
-    D_total = w_in.shape[0]
-    chunks = D_total // N
-    index = jax.lax.axis_index("Y")
-    
-    def body(i, carry):
-        acc, in_chunk = carry
-        in_chunk = jax.lax.ppermute(in_chunk, axis_name="Y", perm=[(j, (j + 1) % N) for j in range(N)])
-        idx = (index - i) % N
-        w_chunk = jax.lax.dynamic_slice_in_dim(w_in, idx * chunks, chunks, axis=0)
-        partial = in_chunk @ w_chunk
-        return acc + partial, in_chunk
-    
-    first_chunk = jax.lax.dynamic_slice_in_dim(w_in, index * chunks, chunks, axis=0)
-    first_mat_mul = input @ first_chunk
-    
-    out, _ = jax.lax.fori_loop(1, N, body, (first_mat_mul, input))
-    return out  
-
-def baseline_mlp(input, w_in, w_out):
-    in_full = jax.lax.all_gather(input, axis_name="Y", axis=1, tiled=True)
-    tmp_local = in_full @ w_in  
-    out_partial = tmp_local @ w_out 
-    return jax.lax.psum_scatter(out_partial, axis_name="Y", scatter_dimension=1, tiled=True)
-
-# In[BX, DY] *D Win[D, FY] -> Tmp[BX, FY]
-def baseline_all_gather_matmul(input, w_in):
-    in_full = jax.lax.all_gather(input, axis_name="Y", axis=1, tiled=True)  # [B_local, D]
-    out = in_full @ w_in  # [B_local, F_local]
-    return out 
-
 B, D, F = 64, 64, 256
 key = jax.random.PRNGKey(0)
 W = jax.random.normal(key, (D, F), jnp.float32)
-W_out = jax.random.normal(key, (F, D), jnp.float32)
 A = jax.random.normal(key, (B, D), jnp.float32)
-TMP = jax.random.normal(key, (B, D), jnp.float32)
+
 explicit_mesh = jax.make_mesh((2,4), ("X","Y"), (Explicit, Explicit))
 
 W_explicit_sharded = jax.device_put(W, jax.NamedSharding(explicit_mesh, jax.P("Y", None)))
 A_explicit_sharded = jax.device_put(A, jax.NamedSharding(explicit_mesh, jax.P("X", "Y")))
-TMP_explicit_sharded = jax.device_put(TMP, jax.NamedSharding(explicit_mesh, jax.P("X", "Y")))
-W_in_explicit_sharded = jax.device_put(W, jax.NamedSharding(explicit_mesh, jax.P(None, "Y")))
-W_out_explicit_sharded = jax.device_put(W_out, jax.NamedSharding(explicit_mesh, jax.P("Y", None)))
-
 
 for name, fn in [
    # ("moe_sorted_jit", moe_sorted_jit),
@@ -156,22 +109,7 @@ if __name__ == "__main__":
             jax.shard_map(functools.partial(collective_scatter_reduce_matmul)
                                             , in_specs = explicit_specs, out_specs = jax.P("X", "Y"))
         )
-        baseline_all_gather_matmul_jit = jax.jit(
-            jax.shard_map(functools.partial(baseline_all_gather_matmul)
-                                                    , in_specs = explicit_specs_all_gather, out_specs = jax.P("X", "Y"))
-        )
-        collective_all_gather_matmul_jit = jax.jit(
-            jax.shard_map(functools.partial(collective_all_gather_matmul)
-                                            , in_specs = explicit_specs_all_gather, out_specs = jax.P("X", "Y"))
-        )
-        baseline_mlp_jit = jax.jit(
-            jax.shard_map(functools.partial(baseline_mlp)
-                                            , in_specs = explicit_specs_mlp, out_specs = jax.P("X", "Y"))
-        )
-        collective_mlp_jit = jax.jit(
-            jax.shard_map(functools.partial(collective_mlp)
-                                            , in_specs = explicit_specs_mlp, out_specs = jax.P("X", "Y"))
-        )
+
         
         want = baseline_allreduce_matmul_jit(A_explicit_sharded, W_explicit_sharded)
         for name, fn in [
@@ -179,27 +117,12 @@ if __name__ == "__main__":
             ("collective_scatter_reduce_matmul", collective_scatter_reduce_matmul_jit)
         ]:
             out = fn(A_explicit_sharded, W_explicit_sharded)
-
+            #print (jax.device_get(want))
+            #print (jax.device_get(out) )
             assert jnp.allclose(jax.device_get(want), jax.device_get(out), atol=1e-2), f"{name} result doesn't match reference"
 
         print(" matches reference")
         
-        for name, fn in [
-                    ("baseline_all_gather_matmul", baseline_all_gather_matmul_jit),
-                    ("collective_all_gather_matmul", collective_all_gather_matmul_jit)
-                ]:
-                    out = fn(TMP_explicit_sharded, W_in_explicit_sharded)
-                
-                    assert jnp.allclose(jax.device_get(want), jax.device_get(out), atol=1e-2), f"{name} result doesn't match reference"
-        
-        for name, fn in [
-                    ("baseline_mlp", baseline_mlp_jit),
-                    ("collective_mlp", collective_mlp_jit)
-                ]:
-                    out = fn(A_explicit_sharded, W_in_explicit_sharded, W_out_explicit_sharded)
-
-                    want_mlp = (A @ W) @ W_out
-                    assert jnp.allclose(jax.device_get(want_mlp), jax.device_get(out), atol=1e-2), f"{name} result doesn't match reference"
         
 """
 footnote :
