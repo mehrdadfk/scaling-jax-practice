@@ -289,9 +289,7 @@ if __name__ == "__main__":
             ("moe_all_to_all_ragged", moe_all_to_all_ragged_jit),
         ]:
             out = fn(A_explicit_sharded, W_explicit_sharded, B_explicit_sharded)
-            print("test1\n")
             print (jax.device_get(want))
-            print("test2\n")
             print (jax.device_get(out) )
             assert jnp.allclose(jax.device_get(want), jax.device_get(out), atol=1e-2), f"{name} result doesn't match reference"
 
