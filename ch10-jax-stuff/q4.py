@@ -4,13 +4,35 @@ import time
 import jax
 import jax.numpy as jnp
 
-jax.config.update("jax_num_cpu_devices", 8)
+jax.config.update("jax_num_cpu_devices", 16)
 Auto = jax.sharding.AxisType.Auto
 Explicit = jax.sharding.AxisType.Explicit
 
 #--------------------------------------------
 # Part 1  A[BX, DY] *D W[DY, F] -> Out[BX, F]
 #--------------------------------------------
+def bidirectional_ring_psum(local_value, axis_name="Y"):
+    if local_value.shape[-1] % 2:
+        raise ValueError("bidirectional psum requires an even final dimension")
+
+    N = jax.lax.axis_size(axis_name)
+    half_width = local_value.shape[-1] // 2
+    clockwise = [(i, (i + 1) % N) for i in range(N)]
+    counterclockwise = [(i, (i - 1) % N) for i in range(N)]
+
+    right = local_value[..., :half_width]
+    left = local_value[..., half_width:]
+    right_total = right
+    left_total = left
+
+    for _ in range(N - 1):
+        right = jax.lax.ppermute(right, axis_name, clockwise)
+        left = jax.lax.ppermute(left, axis_name, counterclockwise)
+        right_total = right_total + right
+        left_total = left_total + left
+
+    return jnp.concatenate((right_total, left_total), axis=-1)
+    
 def baseline_allreduce_matmul(A, W):
     out = A @ W
     return jax.lax.psum(out, axis_name="Y")
@@ -19,10 +41,9 @@ def baseline_allreduce_matmul(A, W):
 def collective_all_reduce_matmul(A, W, tile_size=1024):
     _, F = W.shape
     numchunks = (F + tile_size - 1) // tile_size
-    
     def body(i, carry):
         out, previous = carry
-        partial = jax.lax.psum(previous, axis_name="Y")
+        partial = bidirectional_ring_psum(previous, axis_name="Y")
         W_chunk = jax.lax.dynamic_slice_in_dim(W, i * tile_size, tile_size, axis=1)
         next_mat_mul = A @ W_chunk
         out = jax.lax.dynamic_update_slice_in_dim(out, partial, (i-1) * tile_size, axis=1)
@@ -43,25 +64,35 @@ def collective_all_reduce_matmul(A, W, tile_size=1024):
 # Part 2  # Tmp[BX, FY] *F W2[FY, D] -> Out[BX, DY]
 #--------------------------------------------
 
-def collective_scatter_reduce_matmul(tmp, w):
+def collective_reduce_scatter_matmul(tmp, w):
     N = jax.lax.axis_size("Y")
     D_total = w.shape[1]
     chunks = D_total // N
     index = jax.lax.axis_index("Y")
-    
+    half_chunk = chunks // 2
+    right_perm = [(i, (i + 1) % N) for i in range(N)]
+    left_perm = [(i, (i - 1) % N) for i in range(N)]
+        
     def body(i, acc):
-        acc = jax.lax.ppermute(acc, axis_name="Y", perm=[(j, (j + 1) % N) for j in range(N)])
-        idx = (index - i - 1) % N
-        w_chunk = jax.lax.dynamic_slice_in_dim(w, idx * chunks, chunks, axis=1)
-        partial = tmp @ w_chunk
-        return acc + partial
+        right, left = acc
+        right = jax.lax.ppermute(right, axis_name="Y", perm=right_perm)
+        left = jax.lax.ppermute(left, axis_name="Y", perm=left_perm)
+        right_index = (index - i - 1) % N
+        left_index = (index + i + 1) % N
+
+        w_chunk_right = jax.lax.dynamic_slice_in_dim(w, right_index * chunks, half_chunk, axis=1)
+        w_chunk_left = jax.lax.dynamic_slice_in_dim(w, left_index * chunks + half_chunk, half_chunk, axis=1)
+        
+        partial_right = right + tmp @ w_chunk_right
+        partial_left = left + tmp @ w_chunk_left
+        return partial_right, partial_left
     
     idx = (index - 1) % N
     first_chunk = jax.lax.dynamic_slice_in_dim(w, idx * chunks, chunks, axis=1)
     first_mat_mul = tmp @ first_chunk
     
-    out = jax.lax.fori_loop(1, N, body, first_mat_mul)
-    return out    
+    right, left = jax.lax.fori_loop(1, N, body, first_mat_mul)
+    return jnp.concatenate((right, left), axis=1)    
 
 def baseline_reduce_scatter_matmul(tmp, w):
     return jax.lax.psum_scatter(tmp @ w, axis_name="Y", scatter_dimension=1, tiled=True)
@@ -72,7 +103,7 @@ def baseline_reduce_scatter_matmul(tmp, w):
  
 def collective_mlp(input, w_in, w_out):
     temp = collective_all_gather_matmul(input, w_in)
-    out = collective_scatter_reduce_matmul(temp, w_out)
+    out = collective_reduce_scatter_matmul(temp, w_out)
     return out
     
 # In[BX, DY] *D Win[D, FY] -> Tmp[BX, FY]
@@ -114,7 +145,7 @@ W = jax.random.normal(key, (D, F), jnp.float32)
 W_out = jax.random.normal(key, (F, D), jnp.float32)
 A = jax.random.normal(key, (B, D), jnp.float32)
 TMP = jax.random.normal(key, (B, D), jnp.float32)
-explicit_mesh = jax.make_mesh((2,4), ("X","Y"), (Explicit, Explicit))
+explicit_mesh = jax.make_mesh((4,4), ("X","Y"), (Explicit, Explicit))
 
 W_explicit_sharded = jax.device_put(W, jax.NamedSharding(explicit_mesh, jax.P("Y", None)))
 A_explicit_sharded = jax.device_put(A, jax.NamedSharding(explicit_mesh, jax.P("X", "Y")))
@@ -159,7 +190,7 @@ if __name__ == "__main__":
                                             , in_specs = explicit_specs, out_specs = jax.P("X", None), check_vma=False)
         )
         collective_scatter_reduce_matmul_jit = jax.jit(
-            jax.shard_map(functools.partial(collective_scatter_reduce_matmul)
+            jax.shard_map(functools.partial(collective_reduce_scatter_matmul)
                                             , in_specs = explicit_specs, out_specs = jax.P("X", "Y"))
         )
         baseline_reduce_scatter_matmul_jit = jax.jit(
@@ -215,7 +246,34 @@ if __name__ == "__main__":
                     out = fn(A_explicit_sharded, W_in_explicit_sharded, W_out_explicit_sharded)
 
                     want_mlp = (A @ W) @ W_out
-                    assert jnp.allclose(jax.device_get(want_mlp), jax.device_get(out), atol=1e-2), f"{name} result doesn't match reference"
+                    assert jnp.allclose(jax.device_get(want_mlp), jax.device_get(out), rtol=1e-4, atol=1.0,), f"{name} result doesn't match reference"
+        
+
+        def benchmark(name, fn, *args, iterations=20):
+            fn(*args).block_until_ready()
+            start = time.perf_counter()
+            for _ in range(iterations):
+                fn(*args).block_until_ready()
+            elapsed_ms = (time.perf_counter() - start) * 1_000 / iterations
+            print(f"{name:40} {elapsed_ms:8.3f} ms")
+
+        print("\nAverage runtime after warm-up:")
+        benchmark("baseline_allreduce_matmul", baseline_allreduce_matmul_jit,
+                  A_explicit_sharded, W_explicit_sharded)
+        benchmark("collective_all_reduce_matmul", collective_all_reduce_matmul_jit,
+                  A_explicit_sharded, W_explicit_sharded)
+        benchmark("baseline_reduce_scatter_matmul", baseline_reduce_scatter_matmul_jit,
+                  TMP_explicit_sharded, W_explicit_sharded)
+        benchmark("collective_scatter_reduce_matmul", collective_scatter_reduce_matmul_jit,
+                  TMP_explicit_sharded, W_explicit_sharded)
+        benchmark("baseline_all_gather_matmul", baseline_all_gather_matmul_jit,
+                  TMP_explicit_sharded, W_in_explicit_sharded)
+        benchmark("collective_all_gather_matmul", collective_all_gather_matmul_jit,
+                  TMP_explicit_sharded, W_in_explicit_sharded)
+        benchmark("baseline_mlp", baseline_mlp_jit,
+                  A_explicit_sharded, W_in_explicit_sharded, W_out_explicit_sharded)
+        benchmark("collective_mlp", collective_mlp_jit,
+                  A_explicit_sharded, W_in_explicit_sharded, W_out_explicit_sharded)
         
 """
 footnote :

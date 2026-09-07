@@ -4,7 +4,7 @@ import time
 import jax
 import jax.numpy as jnp
 
-jax.config.update("jax_num_cpu_devices", 8)
+jax.config.update("jax_num_cpu_devices", 16)
 Auto = jax.sharding.AxisType.Auto
 Explicit = jax.sharding.AxisType.Explicit
 
@@ -114,7 +114,7 @@ W = jax.random.normal(key, (D, F), jnp.float32)
 W_out = jax.random.normal(key, (F, D), jnp.float32)
 A = jax.random.normal(key, (B, D), jnp.float32)
 TMP = jax.random.normal(key, (B, D), jnp.float32)
-explicit_mesh = jax.make_mesh((2,4), ("X","Y"), (Explicit, Explicit))
+explicit_mesh = jax.make_mesh((4,4), ("X","Y"), (Explicit, Explicit))
 
 W_explicit_sharded = jax.device_put(W, jax.NamedSharding(explicit_mesh, jax.P("Y", None)))
 A_explicit_sharded = jax.device_put(A, jax.NamedSharding(explicit_mesh, jax.P("X", "Y")))
@@ -216,6 +216,32 @@ if __name__ == "__main__":
 
                     want_mlp = (A @ W) @ W_out
                     assert jnp.allclose(jax.device_get(want_mlp), jax.device_get(out), atol=1e-2), f"{name} result doesn't match reference"
+
+        def benchmark(name, fn, *args, iterations=20):
+            fn(*args).block_until_ready()
+            start = time.perf_counter()
+            for _ in range(iterations):
+                fn(*args).block_until_ready()
+            elapsed_ms = (time.perf_counter() - start) * 1_000 / iterations
+            print(f"{name:40} {elapsed_ms:8.3f} ms")
+
+        print("\nAverage runtime after warm-up:")
+        benchmark("baseline_allreduce_matmul", baseline_allreduce_matmul_jit,
+                  A_explicit_sharded, W_explicit_sharded)
+        benchmark("collective_all_reduce_matmul", collective_all_reduce_matmul_jit,
+                  A_explicit_sharded, W_explicit_sharded)
+        benchmark("baseline_reduce_scatter_matmul", baseline_reduce_scatter_matmul_jit,
+                  TMP_explicit_sharded, W_explicit_sharded)
+        benchmark("collective_scatter_reduce_matmul", collective_scatter_reduce_matmul_jit,
+                  TMP_explicit_sharded, W_explicit_sharded)
+        benchmark("baseline_all_gather_matmul", baseline_all_gather_matmul_jit,
+                  TMP_explicit_sharded, W_in_explicit_sharded)
+        benchmark("collective_all_gather_matmul", collective_all_gather_matmul_jit,
+                  TMP_explicit_sharded, W_in_explicit_sharded)
+        benchmark("baseline_mlp", baseline_mlp_jit,
+                  A_explicit_sharded, W_in_explicit_sharded, W_out_explicit_sharded)
+        benchmark("collective_mlp", collective_mlp_jit,
+                  A_explicit_sharded, W_in_explicit_sharded, W_out_explicit_sharded)
         
 """
 footnote :
