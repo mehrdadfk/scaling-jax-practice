@@ -87,11 +87,18 @@ def collective_reduce_scatter_matmul(tmp, w):
         partial_left = left + tmp @ w_chunk_left
         return partial_right, partial_left
     
-    idx = (index - 1) % N
-    first_chunk = jax.lax.dynamic_slice_in_dim(w, idx * chunks, chunks, axis=1)
-    first_mat_mul = tmp @ first_chunk
-    
-    right, left = jax.lax.fori_loop(1, N, body, first_mat_mul)
+    right_index = (index - 1) % N
+    left_index = (index + 1) % N
+    right_w_chunk = jax.lax.dynamic_slice_in_dim(
+        w, right_index * chunks, half_chunk, axis=1
+    )
+    left_w_chunk = jax.lax.dynamic_slice_in_dim(
+        w, left_index * chunks + half_chunk, half_chunk, axis=1
+    )
+    right = tmp @ right_w_chunk
+    left = tmp @ left_w_chunk
+
+    right, left = jax.lax.fori_loop(1, N, body, (right, left))
     return jnp.concatenate((right, left), axis=1)    
 
 def baseline_reduce_scatter_matmul(tmp, w):
@@ -111,21 +118,41 @@ def collective_all_gather_matmul(input, w_in):
     N = jax.lax.axis_size("Y")
     D_total = w_in.shape[0]
     chunks = D_total // N
+    if chunks % 2:
+        raise ValueError("bidirectional all-gather requires an even input chunk size")
     index = jax.lax.axis_index("Y")
-    
+    half_chunk = chunks // 2
+    right_perm = [(i, (i + 1) % N) for i in range(N)]
+    left_perm = [(i, (i - 1) % N) for i in range(N)]
+
+    def partial_for(in_chunk, chunk_index, offset):
+        w_chunk = jax.lax.dynamic_slice_in_dim(
+            w_in, chunk_index * chunks + offset, half_chunk, axis=0
+        )
+        return in_chunk @ w_chunk
+
+    right = input[:, :half_chunk]
+    left = input[:, half_chunk:]
+    right_total = partial_for(right, index, 0)
+    left_total = partial_for(left, index, half_chunk)
+
     def body(i, carry):
-        acc, in_chunk = carry
-        in_chunk = jax.lax.ppermute(in_chunk, axis_name="Y", perm=[(j, (j + 1) % N) for j in range(N)])
-        idx = (index - i) % N
-        w_chunk = jax.lax.dynamic_slice_in_dim(w_in, idx * chunks, chunks, axis=0)
-        partial = in_chunk @ w_chunk
-        return acc + partial, in_chunk
-    
-    first_chunk = jax.lax.dynamic_slice_in_dim(w_in, index * chunks, chunks, axis=0)
-    first_mat_mul = input @ first_chunk
-    
-    out, _ = jax.lax.fori_loop(1, N, body, (first_mat_mul, input))
-    return out  
+        right, left, right_total, left_total = carry
+        right = jax.lax.ppermute(right, axis_name="Y", perm=right_perm)
+        left = jax.lax.ppermute(left, axis_name="Y", perm=left_perm)
+        right_index = (index - i) % N
+        left_index = (index + i) % N
+        return (
+            right,
+            left,
+            right_total + partial_for(right, right_index, 0),
+            left_total + partial_for(left, left_index, half_chunk),
+        )
+
+    _, _, right_total, left_total = jax.lax.fori_loop(
+        1, N, body, (right, left, right_total, left_total)
+    )
+    return right_total + left_total
 
 def baseline_mlp(input, w_in, w_out):
     in_full = jax.lax.all_gather(input, axis_name="Y", axis=1, tiled=True)
@@ -274,6 +301,7 @@ if __name__ == "__main__":
                   A_explicit_sharded, W_in_explicit_sharded, W_out_explicit_sharded)
         benchmark("collective_mlp", collective_mlp_jit,
                   A_explicit_sharded, W_in_explicit_sharded, W_out_explicit_sharded)
+        
         
 """
 footnote :
