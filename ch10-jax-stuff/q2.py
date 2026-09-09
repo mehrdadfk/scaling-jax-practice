@@ -1,9 +1,14 @@
+import os
+
 import jax
 import jax.numpy as jnp
 
 jax.config.update("jax_num_cpu_devices", 4)
 Auto = jax.sharding.AxisType.Auto
 Explicit = jax.sharding.AxisType.Explicit
+
+TRACE_DIR = os.environ.get("JAX_TRACE_DIR")
+TRACE_ITERS = int(os.environ.get("JAX_TRACE_ITERS", "3"))
 
 """
 W: float32[EX, D, F]
@@ -269,17 +274,6 @@ if __name__ == "__main__":
 
     print(f"moe_local matches reference: {jnp.allclose(got, want)}")
     
-    print("Profiling moe_sorted_jit (the version that AllGathers A)...")
-    with jax.profiler.trace("/tmp/jax-trace-q2-f"):
-        with jax.named_scope("moe_sorted_jit"):
-            out = moe_sorted_jit(A_sharded, W_sharded, B_sharded)
-            out.block_until_ready()
-        with jax.named_scope("moe_ragged_jit"):
-            out = moe_ragged_jit(A_sharded, W_sharded, B_sharded)
-            out.block_until_ready()
-    print("Trace written to /tmp/jax-trace-q2-f")
-    print(f"moe_local matches reference: {jnp.allclose(got, out)}")
-
     with jax.set_mesh(explicit_mesh):
         for name, fn in [
             #("moe_all_gather (pass 1: all_gather)", moe_all_gather_jit),
@@ -296,6 +290,31 @@ if __name__ == "__main__":
         got_k = moe_k_expert_jit(A_explicit_sharded, W_explicit_sharded, BK_explicit_sharded)
         assert jnp.allclose(jax.device_get(want_k), jax.device_get(got_k), atol=1e-2), "moe_k_expert result doesn't match reference"
         print("moe_k_expert matches reference")
+
+    if TRACE_DIR:
+        trace_calls = [
+            ("moe_sorted", moe_sorted_jit, (A_sharded, W_sharded, B_sharded)),
+            ("moe_scan", moe_scan_jit, (A_sharded, W_sharded, B_sharded)),
+            ("moe_ragged", moe_ragged_jit, (A_sharded, W_sharded, B_sharded)),
+            ("moe_all_gather_ragged", moe_all_gather_ragged_jit,
+             (A_explicit_sharded, W_explicit_sharded, B_explicit_sharded)),
+            ("moe_all_to_all_ragged", moe_all_to_all_ragged_jit,
+             (A_explicit_sharded, W_explicit_sharded, B_explicit_sharded)),
+            ("moe_k_expert", moe_k_expert_jit,
+             (A_explicit_sharded, W_explicit_sharded, BK_explicit_sharded)),
+        ]
+        for _, fn, args in trace_calls:
+            fn(*args).block_until_ready()
+
+        os.makedirs(TRACE_DIR, exist_ok=True)
+        print(f"Capturing profiler trace to {TRACE_DIR}...")
+        with jax.profiler.trace(TRACE_DIR):
+            for name, fn, args in trace_calls:
+                with jax.profiler.TraceAnnotation(name):
+                    for _ in range(TRACE_ITERS):
+                        output = fn(*args)
+                    output.block_until_ready()
+        print(f"Trace written to {TRACE_DIR}")
 
 """
 footnotes :

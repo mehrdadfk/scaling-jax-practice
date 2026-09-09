@@ -1,4 +1,5 @@
 import functools
+import os
 import time
 
 import jax
@@ -7,6 +8,9 @@ import jax.numpy as jnp
 jax.config.update("jax_num_cpu_devices", 16)
 Auto = jax.sharding.AxisType.Auto
 Explicit = jax.sharding.AxisType.Explicit
+
+TRACE_DIR = os.environ.get("JAX_TRACE_DIR")
+TRACE_ITERS = int(os.environ.get("JAX_TRACE_ITERS", "3"))
 
 #--------------------------------------------
 # Part 1  A[BX, DY] *D W[DY, F] -> Out[BX, F]
@@ -216,6 +220,38 @@ if __name__ == "__main__":
 
                     want_mlp = (A @ W) @ W_out
                     assert jnp.allclose(jax.device_get(want_mlp), jax.device_get(out), atol=1e-2), f"{name} result doesn't match reference"
+
+        if TRACE_DIR:
+            trace_calls = [
+                ("baseline_allreduce_matmul", baseline_allreduce_matmul_jit,
+                 (A_explicit_sharded, W_explicit_sharded)),
+                ("collective_all_reduce_matmul", collective_all_reduce_matmul_jit,
+                 (A_explicit_sharded, W_explicit_sharded)),
+                ("baseline_reduce_scatter_matmul", baseline_reduce_scatter_matmul_jit,
+                 (TMP_explicit_sharded, W_explicit_sharded)),
+                ("collective_reduce_scatter_matmul", collective_scatter_reduce_matmul_jit,
+                 (TMP_explicit_sharded, W_explicit_sharded)),
+                ("baseline_all_gather_matmul", baseline_all_gather_matmul_jit,
+                 (TMP_explicit_sharded, W_in_explicit_sharded)),
+                ("collective_all_gather_matmul", collective_all_gather_matmul_jit,
+                 (TMP_explicit_sharded, W_in_explicit_sharded)),
+                ("baseline_mlp", baseline_mlp_jit,
+                 (A_explicit_sharded, W_in_explicit_sharded, W_out_explicit_sharded)),
+                ("collective_mlp", collective_mlp_jit,
+                 (A_explicit_sharded, W_in_explicit_sharded, W_out_explicit_sharded)),
+            ]
+            for _, fn, args in trace_calls:
+                fn(*args).block_until_ready()
+
+            os.makedirs(TRACE_DIR, exist_ok=True)
+            print(f"Capturing profiler trace to {TRACE_DIR}...")
+            with jax.profiler.trace(TRACE_DIR):
+                for name, fn, args in trace_calls:
+                    with jax.profiler.TraceAnnotation(name):
+                        for _ in range(TRACE_ITERS):
+                            output = fn(*args)
+                        output.block_until_ready()
+            print(f"Trace written to {TRACE_DIR}")
 
         def benchmark(name, fn, *args, iterations=20):
             fn(*args).block_until_ready()
