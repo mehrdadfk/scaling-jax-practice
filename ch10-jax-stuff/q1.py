@@ -15,6 +15,11 @@ def average_jit(arr):
     X, Y = mesh_auto.axis_sizes
     return arr.reshape(X, arr.shape[0] // X, Y, arr.shape[1] // Y).mean(axis=(1, 3))
 
+def roll(x, shift):
+    out = jnp.roll(x, shift, 0) - x
+    return out
+
+
 S, D = 8, 8 
 N = jax.device_count
 mesh_auto = jax.make_mesh((2, 4), ("X", "Y"), (Auto, Auto))
@@ -34,6 +39,12 @@ if __name__ == "__main__":
         
         want = average_shard_map_jit(XY_sharded_explicit)
         print(want)
+        
+        want = roll_shard_map_jit = jax.jit(
+                    jax.shard_map(roll, in_specs=jax.P("X", "Y"), out_specs= jax.P("X", "Y"), mesh=mesh_explicit))
+        
+        jnp.allclose(want, 0, atol=1e-2)
+        
     with jax.set_mesh(mesh_auto):
             average_jit = jax.jit(
                         average_jit, out_shardings = jax.NamedSharding(mesh_auto, jax.P("X", "Y")))
